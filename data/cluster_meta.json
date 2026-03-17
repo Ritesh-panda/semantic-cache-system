@@ -1,0 +1,6 @@
+{
+  "clusters": 12,
+  "documents": 16590,
+  "algorithm": "GaussianMixture",
+  "covariance_type": "full"
+}

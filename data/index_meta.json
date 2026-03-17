@@ -1,0 +1,8 @@
+{
+  "dimension": 384,
+  "vectors": 16590,
+  "index_type": "HNSW",
+  "M": 32,
+  "ef_construction": 100,
+  "ef_search": 50
+}
