@@ -6,33 +6,138 @@ Built on the **UCI 20 Newsgroups corpus (~16,590 documents)**, this system avoid
 
 ---
 
-## 📌 System Architecture
+## 📌 Architecture & Visual Diagrams
+
+### 1. High-Level Online Query Execution Flow
+Shows how an incoming query moves through query embedding caching, dominant cluster routing, semantic cache lookup, and FAISS fallback.
 
 ```mermaid
 flowchart TD
     User([User Query]) --> API[POST /query]
     
-    subgraph Embedding & Cluster Routing
-        API --> QCache{In-Memory Query<br/>Embedding Cache}
-        QCache -- Hit --> EmbVec[384-d Vector]
+    subgraph S1["1. Embedding & Cluster Detection"]
+        API --> QCache{In-Memory Query<br/>Embedding Cache?}
+        QCache -- Hit --> EmbVec[384-d Dense Vector]
         QCache -- Miss --> ST[SentenceTransformer<br/>all-MiniLM-L6-v2] --> EmbVec
-        EmbVec --> ClusterDetect[Dominant Cluster<br/>Prediction]
+        EmbVec --> ClusterDetect["Compute Dominant Cluster<br/>argmax(Embeddings · QueryVec)"]
     end
 
-    subgraph Semantic Cache Layer
-        ClusterDetect --> CacheLookup{Cluster-Partitioned<br/>Cache Lookup<br/>Cosine Sim >= 0.85}
-        CacheLookup -- Cache Hit --> HitResp[Return Cached Result<br/>~1-3 ms]
+    subgraph S2["2. Semantic Cache Layer"]
+        ClusterDetect --> CacheLookup{"Cluster Cache Lookup<br/>Cosine Sim >= 0.85?"}
+        CacheLookup -- "HIT (Sim >= 0.85)" --> HitResp["Fetch Cached Result<br/>(Latency: ~1-3 ms)"]
     end
 
-    subgraph Vector Search Engine
-        CacheLookup -- Cache Miss --> FAISS[Cluster-Aware FAISS Search<br/>HNSW Flat + IDMap]
-        FAISS --> Filter[Filter to Cluster Members<br/>Membership > 0.1]
-        Filter --> Format[Format Top-3 Snippets]
-        Format --> StoreCache[Store Query & Vector in Cache]
+    subgraph S3["3. Cluster-Aware Vector Search Engine"]
+        CacheLookup -- "MISS (Sim < 0.85)" --> FAISS["FAISS HNSW ANN Search<br/>(Oversample top 200)"]
+        FAISS --> Filter["Cluster Filter<br/>(Membership > 0.1)"]
+        Filter --> Fallback{"Enough Candidates?"}
+        Fallback -- Yes --> TopK["Select Top-3 Document IDs"]
+        Fallback -- No --> Pad["Pad with FAISS Top Docs"] --> TopK
+        TopK --> Format["Format Text Snippets"]
+        Format --> StoreCache["Store Query + Vector in Cache<br/>(LRU Eviction at 1000 items)"]
     end
 
-    HitResp --> Out([JSON Response])
+    HitResp --> Out([JSON QueryResponse])
     StoreCache --> Out
+```
+
+---
+
+### 2. End-to-End Query Sequence Diagram
+Shows the chronological interaction between the Client, API Layer, In-Memory Caches, and FAISS Vector Store.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client
+    participant API as FastAPI (app.api_service)
+    participant Model as SentenceTransformer
+    participant Cache as Semantic Cache
+    participant FAISS as FAISS HNSW Store
+    participant Corpus as Document Corpus
+
+    Client->>API: POST /query {"query": "space mission failure causes"}
+    
+    rect rgb(240, 248, 255)
+    Note over API,Model: Step 1: Query Vectorization & Cluster Assignment
+    API->>Model: Vectorize query (or hit query_embedding_cache)
+    Model-->>API: 384-d float32 vector
+    API->>API: Compute dominant topic cluster ID
+    end
+
+    rect rgb(245, 255, 245)
+    Note over API,Cache: Step 2: Cluster-Routed Semantic Cache Check
+    API->>Cache: lookup(query_embedding, cluster_id)
+    alt Cache HIT (Cosine Sim >= 0.85)
+        Cache-->>API: Cached result + matched query + similarity score
+        API-->>Client: 200 OK (cache_hit: true, latency ~1-3ms)
+    else Cache MISS
+        Cache-->>API: null
+    end
+    end
+
+    rect rgb(255, 248, 240)
+    Note over API,Corpus: Step 3: Vector Retrieval & Fallback (Only on Miss)
+    API->>FAISS: cluster_search(query_embedding, cluster_id, k=10)
+    FAISS-->>API: Filtered Doc IDs
+    API->>Corpus: Fetch text snippets by doc IDs
+    Corpus-->>API: Raw text
+    API->>Cache: add_entry(query, embedding, cluster_id, result)
+    API-->>Client: 200 OK (cache_hit: false, latency ~15-25ms)
+    end
+```
+
+---
+
+### 3. Offline Pipeline & Index Construction (`rebuild_all.py`)
+Illustrates how the raw dataset is downloaded, cleaned, embedded, indexed, and clustered ahead of time.
+
+```mermaid
+flowchart LR
+    subgraph DataPrep["1. Data Ingestion & Cleaning"]
+        Raw["UCI 20 Newsgroups<br/>Tar Archive"] --> Clean["Clean Headers, Quotes (>),<br/>Signatures & Filter <20 words"]
+        Clean --> Corp["corpus.json (16,590 docs)"]
+    end
+
+    subgraph Embedding["2. Dense Vectorization"]
+        Corp --> ST["SentenceTransformer<br/>all-MiniLM-L6-v2 (CPU / Batch 128)"]
+        ST --> EmbFile["embeddings.npy [16590, 384]"]
+    end
+
+    subgraph Indexing["3. FAISS Vector Store"]
+        EmbFile --> Norm["L2 Normalization"]
+        Norm --> HNSW["Build IndexHNSWFlat<br/>(M=32, efConst=100, efSearch=50)"]
+        HNSW --> IdMap["Wrap with IndexIDMap"]
+        IdMap --> FaissFile["news_index.faiss"]
+    end
+
+    subgraph Clustering["4. Fuzzy GMM Clustering"]
+        EmbFile --> BIC["BIC Analysis over K∈[10,15]"]
+        BIC --> GMM["Fit GMM (K=12, Full Covariance)"]
+        GMM --> Probs["cluster_probs.npy [16590, 12]"]
+    end
+```
+
+---
+
+### 4. Cluster-Partitioned Cache vs. Global Cache Search
+Demonstrates how clustering divides the search space to maintain low lookup latency.
+
+```mermaid
+flowchart TD
+    subgraph Global["Standard Flat Semantic Cache (O(N) Search)"]
+        direction TB
+        Q1[Query] --> ALL["Scan Every Cached Query in Entire Database<br/>(Scales poorly as cache grows)"]
+    end
+
+    subgraph Partitioned["Cluster-Partitioned Semantic Cache (O(N_k) Search)"]
+        direction TB
+        Q2[Query] --> Det["Detect Dominant Cluster (e.g. Cluster 3: Space/Sci)"]
+        Det --> C0["Cluster 0 (Comp)"]
+        Det --> C1["Cluster 1 (Rec)"]
+        Det --> C3["Cluster 3 (Sci.Space) — ONLY Search Here!"]
+        Det --> C11["Cluster 11 (Talk.Politics)"]
+    end
 ```
 
 ---
